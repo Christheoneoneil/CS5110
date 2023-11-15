@@ -1,6 +1,6 @@
 """
 script that provides tools for building and fitting a model
-with the tensflow and ares workflow
+with the tensflow and kares workflow
 """
 
 import tensorflow as tf
@@ -14,9 +14,12 @@ import missingno as msno
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
 import os
+import tempfile
+
 
 pd.set_option('display.max_rows', 500)
 pd.set_option('display.max_columns', 500)
+
 
 def train_val_test_split(filepath:str, target_col:str="TARGET", impute:bool=False)->pd.DataFrame:
     df = pd.read_csv(filepath)
@@ -24,6 +27,7 @@ def train_val_test_split(filepath:str, target_col:str="TARGET", impute:bool=Fals
     print(df.isnull().sum())
     # msno.matrix(df)
     # plt.show()
+    #@TODO: code in oversampler undersampler, initial bias term doesn not help with precesion. 
     if impute:
         imp_path = "data/df_imputed.csv"
         if os.path.exists(imp_path):
@@ -32,12 +36,14 @@ def train_val_test_split(filepath:str, target_col:str="TARGET", impute:bool=Fals
         else: 
             df = impute_func(df, target_col)
             df.to_csv(imp_path)
+
     print("Nulls after imputation:")
     print(df.isnull().sum())
     print(df.describe())
+    neg, pos = np.bincount(df[target_col])
     train, val, test = np.split(df.sample(frac=1), [int(0.8*len(df)), int(0.9*len(df))])
 
-    return train, val, test 
+    return train, val, test, neg, pos
 
 
 def impute_func(df, target_col):
@@ -62,6 +68,7 @@ def conv_to_dataset(dataframe, target_col="TARGET" , shuffle=True, batch_size=25
         ds = ds.shuffle(buffer_size=len(dataframe))
     ds = ds.batch(batch_size)
     ds = ds.prefetch(batch_size)
+    
     return ds
 
 
@@ -107,68 +114,83 @@ def build_mod(metrics:list, encoded_features:list, all_inputs:list, optimizer:st
     x = tf.keras.layers.Dense(32, activation="relu")(all_features)
     x = tf.keras.layers.Dropout(0.5)(x)
     output = tf.keras.layers.Dense(1, activation='sigmoid', bias_initializer=output_bias)(x)
-    model = tf.keras.Sequential(all_inputs, output)
+    model = tf.keras.Model(all_inputs, output)
     model.compile(optimizer=optimizer,
                 loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
                 metrics=metrics)
 
     return model
   
-train, val, test = train_val_test_split("data/loan_data (1).csv", target_col="TARGET", impute=True)
-batch_size = 256
-# train_ds = conv_to_dataset(train, batch_size=batch_size)
-# val_ds = conv_to_dataset(val, shuffle=False, batch_size=batch_size)
-# test_ds = conv_to_dataset(test, shuffle=False, batch_size=batch_size)
 
-# float_cols = [x for x in list(train.select_dtypes(np.float64).columns) if x != "TARGET"]
-# int_cols = [x for x in list(train.select_dtypes(np.int64).columns) if x != "TARGET"]
-# str_cols = [x for x in list(train.select_dtypes(np.object_).columns)]
+train, val, test, neg, pos = train_val_test_split("data/loan_data (1).csv", target_col="TARGET", impute=True)
+total = neg + pos
+print('Examples:\n    Total: {}\n    Positive: {} ({:.2f}% of total)\n'.format(
+    total, pos, 100 * pos / total))
 
-# all_inputs = []
-# encoded_features = []
-# for header in float_cols:
-#   numeric_col = tf.keras.Input(shape=(1,), name=header)
-#   normalization_layer = get_normalization_layer(header, train_ds)
-#   encoded_numeric_col = normalization_layer(numeric_col)
-#   all_inputs.append(numeric_col)
-#   encoded_features.append(encoded_numeric_col)
 
-# for col, type in zip([int_cols, str_cols], ["int64", "string"]): 
-#     for header in col:
-#         enc_col = tf.keras.Input(shape=(1,), name=header, dtype=type)
-#         enc_cat_layer = get_category_encoding_layer(header, train_ds, type, max_tokens=5)
-#         encoded_cat_col = enc_cat_layer(enc_col)
-#         all_inputs.append(enc_col)
-#         encoded_features.append(encoded_cat_col)
+batch_size = 2046
+train_ds = conv_to_dataset(train, shuffle=False ,batch_size=batch_size)
+val_ds = conv_to_dataset(val, shuffle=False, batch_size=batch_size)
+test_ds = conv_to_dataset(test, shuffle=False, batch_size=batch_size)
+model_path = 'housing_model.keras'
 
-# all_features = tf.keras.layers.concatenate(encoded_features)
-# x = tf.keras.layers.Dense(32, activation="relu")(all_features)
-# x = tf.keras.layers.Dropout(0.5)(x)
-# output = tf.keras.layers.Dense(1)(x)
+metrics = [
+        keras.metrics.BinaryCrossentropy(name='cross entropy'),  # same as model's loss
+        keras.metrics.MeanSquaredError(name='Brier score'),
+        keras.metrics.TruePositives(name='tp'),
+        keras.metrics.FalsePositives(name='fp'),
+        keras.metrics.TrueNegatives(name='tn'),
+        keras.metrics.FalseNegatives(name='fn'), 
+        keras.metrics.BinaryAccuracy(name='accuracy'),
+        keras.metrics.Precision(name='precision'),
+        keras.metrics.Recall(name='recall'),
+        keras.metrics.AUC(name='auc'),
+        keras.metrics.AUC(name='prc', curve='PR'), # precision-recall curve
+    ]
 
-# model = tf.keras.Model(all_inputs, output)
-# model.compile(optimizer='adam',
-#               loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
-#               metrics=["accuracy", keras.metrics.FalseNegatives(name='fn')])
+if os.path.exists(model_path):
+    model = tf.keras.models.load_model(model_path)
 
-# tf.keras.utils.plot_model(model, show_shapes=True, rankdir="LR")
-# model.fit(train_ds, epochs=10, validation_data=val_ds, verbose=False)
+else:
+    float_cols = [x for x in list(train.select_dtypes(np.float64).columns) if x != "TARGET"]
+    int_cols = [x for x in list(train.select_dtypes(np.int64).columns) if x != "TARGET"]
+    str_cols = [x for x in list(train.select_dtypes(np.object_).columns)]
 
-# loss, accuracy, fp = model.evaluate(test_ds)
+    all_inputs = []
+    encoded_features = []
+    for header in float_cols:
+        numeric_col = tf.keras.Input(shape=(1,), name=header)
+        normalization_layer = get_normalization_layer(header, train_ds)
+        encoded_numeric_col = normalization_layer(numeric_col)
+        all_inputs.append(numeric_col)
+        encoded_features.append(encoded_numeric_col)
 
-# print("loss:", loss, "accuracy:", accuracy, "False Positives:", fp)
-# metrics = [
-#       keras.metrics.BinaryCrossentropy(name='cross entropy'),  # same as model's loss
-#       keras.metrics.MeanSquaredError(name='Brier score'),
-#       keras.metrics.TruePositives(name='tp'),
-#       keras.metrics.FalsePositives(name='fp'),
-#       keras.metrics.TrueNegatives(name='tn'),
-#       keras.metrics.FalseNegatives(name='fn'), 
-#       keras.metrics.BinaryAccuracy(name='accuracy'),
-#       keras.metrics.Precision(name='precision'),
-#       keras.metrics.Recall(name='recall'),
-#       keras.metrics.AUC(name='auc'),
-#       keras.metrics.AUC(name='prc', curve='PR'), # precision-recall curve
-# ]
+    for col, type in zip([int_cols, str_cols], ["int64", "string"]): 
+        for header in col:
+            enc_col = tf.keras.Input(shape=(1,), name=header, dtype=type)
+            enc_cat_layer = get_category_encoding_layer(header, train_ds, type, max_tokens=5)
+            encoded_cat_col = enc_cat_layer(enc_col)
+            all_inputs.append(enc_col)
+            encoded_features.append(encoded_cat_col)
 
-# model = build_mod(metrics=metrics, encoded_features=encoded_features, all_inputs=all_inputs)
+
+    early_stopping = tf.keras.callbacks.EarlyStopping(
+        monitor='val_prc', 
+        verbose=1,
+        patience=10,
+        mode='max',
+        restore_best_weights=True)
+
+    init_bias = np.log([pos/neg])
+    initial_weights = os.path.join(tempfile.mkdtemp(), 'initial_weights')
+    if os.path.exists(initial_weights):
+        
+        model =  build_mod(metrics=metrics, encoded_features=encoded_features, all_inputs=all_inputs)
+        model.load_weights(initial_weights)
+        
+    else:
+        model = build_mod(metrics=metrics, encoded_features=encoded_features, all_inputs=all_inputs, output_bias=init_bias)
+        model.save_weights(initial_weights)
+        
+    model.fit(train_ds, epochs=10, validation_data=val_ds, verbose=1, callbacks=[early_stopping])
+    model.save(model_path)
