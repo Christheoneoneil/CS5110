@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import missingno as msno
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
+import os
 
 pd.set_option('display.max_rows', 500)
 pd.set_option('display.max_columns', 500)
@@ -24,19 +25,32 @@ def train_val_test_split(filepath:str, target_col:str="TARGET", impute:bool=Fals
     # msno.matrix(df)
     # plt.show()
     if impute:
-        impute_func(df, target_col)
+        imp_path = "data/df_imputed.csv"
+        if os.path.exists(imp_path):
+            df = pd.read_csv(imp_path)
+            
+        else: 
+            df = impute_func(df, target_col)
+            df.to_csv(imp_path)
+    print("Nulls after imputation:")
+    print(df.isnull().sum())
+    print(df.describe())
     train, val, test = np.split(df.sample(frac=1), [int(0.8*len(df)), int(0.9*len(df))])
 
     return train, val, test 
 
+
 def impute_func(df, target_col):
     df = df.copy()
-    it = IterativeImputer(max_iter=10, random_state=0)
     str_cols = [x for x in list(df.select_dtypes(np.object_).columns)]
     num_cols = [x for x in list(df.columns) if x not in str_cols and x != target_col]
-    
+    # Create an iterative imputer that has min values based on each feature 
+    it = IterativeImputer(max_iter=10, random_state=0, min_value=[min for min in list(df[num_cols].min())])
     df.loc[:, num_cols] = it.fit_transform(df.loc[:, num_cols])
-    print(df)
+    df.loc[:, str_cols] = df.loc[:, str_cols].apply(lambda x: x.fillna(x.value_counts().index[0]))
+
+    return df
+
 
 def conv_to_dataset(dataframe, target_col="TARGET" , shuffle=True, batch_size=256):
     df = dataframe.copy()
@@ -86,6 +100,20 @@ def get_category_encoding_layer(name, dataset, dtype, max_tokens=None):
     return lambda feature: encoder(index(feature))
 
 
+def build_mod(metrics:list, encoded_features:list, all_inputs:list, optimizer:str='adam' ,output_bias=None):
+    if output_bias is not None:
+        output_bias = tf.keras.initializers.Constant(output_bias)
+    all_features = tf.keras.layers.concatenate(encoded_features)
+    x = tf.keras.layers.Dense(32, activation="relu")(all_features)
+    x = tf.keras.layers.Dropout(0.5)(x)
+    output = tf.keras.layers.Dense(1, activation='sigmoid', bias_initializer=output_bias)(x)
+    model = tf.keras.Sequential(all_inputs, output)
+    model.compile(optimizer=optimizer,
+                loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
+                metrics=metrics)
+
+    return model
+  
 train, val, test = train_val_test_split("data/loan_data (1).csv", target_col="TARGET", impute=True)
 batch_size = 256
 # train_ds = conv_to_dataset(train, batch_size=batch_size)
@@ -129,3 +157,18 @@ batch_size = 256
 # loss, accuracy, fp = model.evaluate(test_ds)
 
 # print("loss:", loss, "accuracy:", accuracy, "False Positives:", fp)
+# metrics = [
+#       keras.metrics.BinaryCrossentropy(name='cross entropy'),  # same as model's loss
+#       keras.metrics.MeanSquaredError(name='Brier score'),
+#       keras.metrics.TruePositives(name='tp'),
+#       keras.metrics.FalsePositives(name='fp'),
+#       keras.metrics.TrueNegatives(name='tn'),
+#       keras.metrics.FalseNegatives(name='fn'), 
+#       keras.metrics.BinaryAccuracy(name='accuracy'),
+#       keras.metrics.Precision(name='precision'),
+#       keras.metrics.Recall(name='recall'),
+#       keras.metrics.AUC(name='auc'),
+#       keras.metrics.AUC(name='prc', curve='PR'), # precision-recall curve
+# ]
+
+# model = build_mod(metrics=metrics, encoded_features=encoded_features, all_inputs=all_inputs)
