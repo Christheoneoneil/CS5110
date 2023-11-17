@@ -15,28 +15,33 @@ from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
 import os
 import tempfile
+from imblearn.under_sampling import RandomUnderSampler
+from imblearn.over_sampling import SMOTENC
 
 
 pd.set_option('display.max_rows', 500)
 pd.set_option('display.max_columns', 500)
 
 
-def train_val_test_split(filepath:str, target_col:str="TARGET", impute:bool=False)->pd.DataFrame:
-    df = pd.read_csv(filepath)
+def train_val_test_split(filepath:str, target_col:str="TARGET", impute:bool=False, resample:bool=False)->pd.DataFrame:
+    df = pd.read_csv(filepath, index_col=["SK_ID_CURR"])
     print(df.describe())
     print(df.isnull().sum())
     # msno.matrix(df)
     # plt.show()
-    #@TODO: code in oversampler undersampler, initial bias term doesn not help with precesion. 
+
     if impute:
         imp_path = "data/df_imputed.csv"
         if os.path.exists(imp_path):
             df = pd.read_csv(imp_path)
             
         else: 
-            df = impute_func(df, target_col)
-            df.to_csv(imp_path)
-
+            df = impute_func(df=df, target_col=target_col)
+            df.to_csv(imp_path, index=False)
+    
+    if resample: 
+        df = resample_func(df=df, target_col=target_col)
+    
     print("Nulls after imputation:")
     print(df.isnull().sum())
     print(df.describe())
@@ -46,7 +51,7 @@ def train_val_test_split(filepath:str, target_col:str="TARGET", impute:bool=Fals
     return train, val, test, neg, pos
 
 
-def impute_func(df, target_col):
+def impute_func(df:pd.DataFrame, target_col:str)->pd.DataFrame:
     df = df.copy()
     str_cols = [x for x in list(df.select_dtypes(np.object_).columns)]
     num_cols = [x for x in list(df.columns) if x not in str_cols and x != target_col]
@@ -55,6 +60,25 @@ def impute_func(df, target_col):
     df.loc[:, num_cols] = it.fit_transform(df.loc[:, num_cols])
     df.loc[:, str_cols] = df.loc[:, str_cols].apply(lambda x: x.fillna(x.value_counts().index[0]))
 
+    return df
+
+
+def resample_func(df:pd.DataFrame, target_col:str):
+    df = df.copy()
+    y = df.pop(target_col)
+    X = df
+    str_cols = [x for x in list(df.select_dtypes(np.object_).columns)]
+    oversample = SMOTENC(sampling_strategy=0.1, categorical_features=str_cols)
+    under = RandomUnderSampler(sampling_strategy=0.5)
+    X, y = oversample.fit_resample(X, y)
+    X, y = under.fit_resample(X, y)
+    y = y.to_frame()
+    X['tmp'] = [i for i in range(len(X))]
+    y['tmp'] = [i for i in range(len(y))]
+    print(X, y)
+    df = pd.merge(X, y)
+    df = df.drop(columns=["tmp"])
+    print(df.columns)
     return df
 
 
@@ -122,7 +146,7 @@ def build_mod(metrics:list, encoded_features:list, all_inputs:list, optimizer:st
     return model
   
 
-train, val, test, neg, pos = train_val_test_split("data/loan_data (1).csv", target_col="TARGET", impute=True)
+train, val, test, neg, pos = train_val_test_split("data/loan_data (1).csv", target_col="TARGET", impute=True, resample=True)
 total = neg + pos
 print('Examples:\n    Total: {}\n    Positive: {} ({:.2f}% of total)\n'.format(
     total, pos, 100 * pos / total))
@@ -183,14 +207,10 @@ else:
 
     init_bias = np.log([pos/neg])
     initial_weights = os.path.join(tempfile.mkdtemp(), 'initial_weights')
-    if os.path.exists(initial_weights):
-        
-        model =  build_mod(metrics=metrics, encoded_features=encoded_features, all_inputs=all_inputs)
-        model.load_weights(initial_weights)
-        
-    else:
-        model = build_mod(metrics=metrics, encoded_features=encoded_features, all_inputs=all_inputs, output_bias=init_bias)
-        model.save_weights(initial_weights)
+    
+
+    model = build_mod(metrics=metrics, encoded_features=encoded_features, all_inputs=all_inputs, output_bias=init_bias)
+    model.save_weights(initial_weights)
         
     model.fit(train_ds, epochs=10, validation_data=val_ds, verbose=1, callbacks=[early_stopping])
     model.save(model_path)
